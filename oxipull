@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Oxipull: download and report Wellue/Viatom Checkme O2 measurements.
+
+No device driver or Python USB package is needed: Linux exposes the device as
+a 64-byte HID raw endpoint.  PDF generation needs matplotlib.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import csv
+import datetime as dt
+import glob
+import json
+import os
+import select
+import statistics as statlib
+import struct
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+VID = "1915"
+PID = "f33d"
+REPORT_SIZE = 64
+VERSION = "0.1.0"
+NBSP = "\N{NO-BREAK SPACE}"
+
+
+COMPLETIONS = {
+    "bash": r'''_oxipull() {
+    local cur prev command word
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    command=""
+    for word in "${COMP_WORDS[@]:1}"; do
+        case "$word" in
+            pull|report|download|device-info|device-time|device-settings|completion)
+                command="$word"; break ;;
+        esac
+    done
+    case "$prev" in
+        -o|--output) COMPREPLY=( $(compgen -d -- "$cur") ); return ;;
+        --brightness) COMPREPLY=( $(compgen -W "low medium high" -- "$cur") ); return ;;
+        --hr-alert|--screen) COMPREPLY=( $(compgen -W "on off" -- "$cur") ); return ;;
+        completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
+    esac
+    if [[ -z "$command" ]]; then
+        COMPREPLY=( $(compgen -W "pull report download device-info device-time device-settings completion --help --version" -- "$cur") )
+    elif [[ "$cur" == -* ]]; then
+        case "$command" in
+            pull|report) COMPREPLY=( $(compgen -W "-o --output --csv --patient --note --help" -- "$cur") ) ;;
+            download) COMPREPLY=( $(compgen -W "-o --output --help" -- "$cur") ) ;;
+            device-time) COMPREPLY=( $(compgen -W "--sync --help" -- "$cur") ) ;;
+            device-settings) COMPREPLY=( $(compgen -W "--time --spo2-alert --hr-alert --hr-low --hr-high --vibration --sound --screen --brightness --factory-reset --yes --help" -- "$cur") ) ;;
+            *) COMPREPLY=( $(compgen -W "--help" -- "$cur") ) ;;
+        esac
+    elif [[ "$command" == report ]]; then
+        COMPREPLY=( $(compgen -f -- "$cur") )
+    fi
+}
+complete -F _oxipull oxipull
+''',
+    "zsh": r'''#compdef oxipull
+_oxipull() {
+    local -a commands
+    commands=(
+        'pull:Neue Messungen laden und auswerten'
+        'report:Vorhandene Rohdaten auswerten'
+        'download:Messungsdateien herunterladen'
+        'device-info:Geräteinformationen anzeigen'
+        'device-time:Gerätezeit anzeigen oder synchronisieren'
+        'device-settings:Geräteeinstellungen anzeigen oder ändern'
+        'completion:Shell-Completion ausgeben'
+    )
+    _arguments -C '(-h --help)'{-h,--help}'[Hilfe anzeigen]' '--version[Programmversion anzeigen]' '1: :->command' '*:: :->args'
+    case "$state" in
+        command) _describe 'Befehl' commands ;;
+        args)
+            case "$words[2]" in
+                pull) _arguments '(-o --output)'{-o,--output}'[Zielordner]:Ordner:_directories' '--csv[CSV-Dateien erzeugen]' '--patient[Patientenname]:Name:' '--note[Notiz]:Text:' ;;
+                report) _arguments '*:Rohdatei:_files' '(-o --output)'{-o,--output}'[Zielordner]:Ordner:_directories' '--csv[CSV-Dateien erzeugen]' '--patient[Patientenname]:Name:' '--note[Notiz]:Text:' ;;
+                download) _arguments '1:Gerätedatei:' '(-o --output)'{-o,--output}'[Zielordner]:Ordner:_directories' ;;
+                device-time) _arguments '--sync[Systemzeit auf das Gerät übertragen]' ;;
+                device-settings) _arguments '--time[Gerätezeit]:Zeit:' '--spo2-alert[SpO2-Schwelle]:Wert:' '--hr-alert[Pulsalarm]:Wert:(on off)' '--hr-low[Untere Pulsschwelle]:BPM:' '--hr-high[Obere Pulsschwelle]:BPM:' '--vibration[Vibrationsstärke]:Prozent:' '--sound[Lautstärke]:Prozent:' '--screen[Bildschirmmodus]:Wert:(on off)' '--brightness[Displayhelligkeit]:Stufe:(low medium high)' '--factory-reset[Werkseinstellungen]' '--yes[Zurücksetzen bestätigen]' ;;
+                completion) _values 'Shell' bash zsh fish ;;
+            esac ;;
+    esac
+}
+_oxipull "$@"
+''',
+    "fish": r'''complete -c oxipull -f
+complete -c oxipull -n '__fish_use_subcommand' -a pull -d 'Neue Messungen laden und auswerten'
+complete -c oxipull -n '__fish_use_subcommand' -a report -d 'Vorhandene Rohdaten auswerten'
+complete -c oxipull -n '__fish_use_subcommand' -a download -d 'Messungsdateien herunterladen'
+complete -c oxipull -n '__fish_use_subcommand' -a device-info -d 'Geräteinformationen anzeigen'
+complete -c oxipull -n '__fish_use_subcommand' -a device-time -d 'Gerätezeit anzeigen oder synchronisieren'
+complete -c oxipull -n '__fish_use_subcommand' -a device-settings -d 'Geräteeinstellungen anzeigen oder ändern'
+complete -c oxipull -n '__fish_use_subcommand' -a completion -d 'Shell-Completion ausgeben'
+complete -c oxipull -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+complete -c oxipull -n '__fish_seen_subcommand_from report' -F
+complete -c oxipull -n '__fish_seen_subcommand_from pull report' -s o -l output -r -F
+complete -c oxipull -n '__fish_seen_subcommand_from pull report' -l csv
+complete -c oxipull -n '__fish_seen_subcommand_from pull report' -l patient -r
+complete -c oxipull -n '__fish_seen_subcommand_from pull report' -l note -r
+complete -c oxipull -n '__fish_seen_subcommand_from download' -s o -l output -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-time' -l sync
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l time -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l spo2-alert -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l hr-alert -xa 'on off'
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l hr-low -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l hr-high -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l vibration -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l sound -r
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l screen -xa 'on off'
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l brightness -xa 'low medium high'
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l factory-reset
+complete -c oxipull -n '__fish_seen_subcommand_from device-settings' -l yes
+''',
+}
+
+
+def crc8(data: bytes) -> int:
+    crc = 0
+    for value in data:
+        check = crc ^ value
+        crc = 0
+        for bit, mask in enumerate((0x07, 0x0E, 0x1C, 0x38, 0x70, 0xE0, 0xC7, 0x89)):
+            if check & (1 << bit):
+                crc ^= mask
+    return crc
+
+
+def packet(command: int, data: bytes = b"", block: int = 0) -> bytes:
+    body = struct.pack("<BBBHH", 0xAA, command, command ^ 0xFF, block, len(data)) + data
+    return body + bytes((crc8(body),))
+
+
+def find_device() -> str:
+    for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        device = Path(path).resolve()
+        for parent in (device, *device.parents):
+            try:
+                if (parent / "idVendor").read_text().strip().lower() == VID and (parent / "idProduct").read_text().strip().lower() == PID:
+                    node = "/dev/" + Path(path).name
+                    if os.path.exists(node):
+                        return node
+            except (FileNotFoundError, PermissionError):
+                pass
+    raise RuntimeError("Checkme O2 (1915:f33d) nicht gefunden; USB-Verbindung und udev-Regel prüfen")
+
+
+class CheckmeHID:
+    def __init__(self, path: str | None = None, timeout: float = 5.0):
+        self.path = path or find_device()
+        self.timeout = timeout
+        self.fd: int | None = None
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        except PermissionError as exc:
+            raise RuntimeError(f"Keine Berechtigung für {self.path}; siehe 60-checkme-o2.rules") from exc
+        return self
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def transact(self, command: int, data: bytes = b"", block: int = 0) -> bytes:
+        assert self.fd is not None
+        request = packet(command, data, block)
+        # USB adds a one-byte chunk length in front of up to 63 protocol bytes.
+        # hidapi itself also uses a report-ID byte, but Linux hidraw strips that
+        # API-level byte; the device's chunk length is therefore report byte 0.
+        for offset in range(0, len(request), REPORT_SIZE - 1):
+            chunk = request[offset:offset + REPORT_SIZE - 1]
+            report = (bytes((len(chunk),)) + chunk).ljust(REPORT_SIZE, b"\0")
+            # hidraw/hidapi convention: byte 0 is report ID (zero because this
+            # descriptor has no numbered reports), followed by 64 report bytes.
+            os.write(self.fd, b"\0" + report)
+
+        received = bytearray()
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self.fd], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            report = os.read(self.fd, REPORT_SIZE)
+            chunk_size = report[0]
+            if chunk_size > REPORT_SIZE - 1:
+                continue
+            chunk = report[1:1 + chunk_size]
+            received.extend(chunk)
+            # A short chunk terminates the USB response. Unlike BLE responses,
+            # the USB stream begins with a 7-byte 55/00/FF transport header and
+            # has no outer AA/CRC packet.
+            if chunk_size < REPORT_SIZE - 1:
+                return bytes(received)
+        raise TimeoutError(f"Keine vollständige Antwort auf USB-Kommando 0x{command:02x}")
+
+    def info(self) -> dict:
+        raw = self.transact(0x14)
+        text = raw[raw.find(b"{"):raw.rfind(b"}") + 1].decode("utf-8")
+        return json.loads(text)
+
+    def configure(self, values: dict) -> dict:
+        """Write documented Viatom configuration keys and verify by INFO."""
+        if not values:
+            return self.info()
+        payload = json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        reply = self.transact(0x16, payload)
+        if len(reply) < 12:
+            raise RuntimeError("Unvollständige Antwort beim Schreiben der Einstellungen")
+        return self.info()
+
+    def download(self, filename: str) -> bytes:
+        reply = self.transact(0x03, filename.encode("ascii") + b"\0")
+        # USB response: 7-byte transport header, uint32 file size, checksum.
+        size = struct.unpack_from("<I", reply, 7)[0] if len(reply) >= 12 else None
+        if size is None or not 40 <= size <= 100_000_000:
+            raise RuntimeError("Dateigröße in Geräteantwort nicht erkannt")
+        result = bytearray()
+        try:
+            for block in range((size + 511) // 512):
+                response = self.transact(0x04, block=block)
+                wanted = min(512, size - len(result))
+                if len(response) < 7 + wanted:
+                    raise RuntimeError(f"Datenblock {block} ist zu kurz")
+                result.extend(response[7:7 + wanted])
+                if len(result) >= size:
+                    return bytes(result[:size])
+        finally:
+            try:
+                self.transact(0x05)
+            except Exception:
+                pass
+        raise RuntimeError(f"Download unvollständig: {len(result)}/{size} Bytes")
+
+
+@dataclass
+class Recording:
+    source: Path
+    start: dt.datetime
+    duration: int
+    interval: float
+    spo2: list[int | None]
+    pulse: list[int | None]
+    motion: list[int]
+    reported_drops3: int | None = None
+    reported_drops4: int | None = None
+    reported_spo2_avg: int | None = None
+    reported_hr_avg: int | None = None
+
+
+def parse_recording(path: Path) -> Recording:
+    raw = path.read_bytes()
+    if len(raw) < 45:
+        raise ValueError("Datei ist zu kurz")
+    version, year = struct.unpack_from("<HH", raw)
+    if version not in (3, 5):
+        raise ValueError(f"Nicht unterstützte VLD-Version {version}")
+    start = dt.datetime(year, raw[4], raw[5], raw[6], raw[7], raw[8])
+    # V5 stores a 32-bit duration at byte 13.  V3 uses the older 16-bit
+    # field at byte 18 (as implemented by OSCAR and documented by o2r).
+    duration = struct.unpack_from("<I", raw, 13)[0] if version == 5 else struct.unpack_from("<H", raw, 18)[0]
+    records = raw[40:]
+    count = len(records) // 5
+    if not count:
+        raise ValueError("Keine Messpunkte")
+    spo2, pulse, motion = [], [], []
+    for offset in range(0, count * 5, 5):
+        oxygen, heart, invalid, movement, _vibration = records[offset:offset + 5]
+        valid = not invalid and oxygen != 0xFF and heart != 0xFF
+        spo2.append(oxygen if valid and 50 <= oxygen <= 100 else None)
+        pulse.append(heart if valid and 20 <= heart <= 250 else None)
+        motion.append(movement)
+    interval = duration / count if duration else 4.0
+    reported = (raw[19], raw[20], raw[17], raw[30]) if version == 5 else (None, None, None, None)
+    return Recording(path, start, duration or round(count * interval), interval, spo2, pulse, motion, *reported)
+
+
+def desaturations(values: list[int | None], threshold: int) -> int:
+    """Count baseline-to-nadir drops, requiring recovery before a new event."""
+    baseline = None
+    in_event = False
+    count = 0
+    for value in values:
+        if value is None:
+            baseline = None
+            in_event = False
+            continue
+        baseline = value if baseline is None else max(value, baseline)
+        drop = baseline - value
+        if not in_event and drop >= threshold:
+            count += 1
+            in_event = True
+        elif in_event and drop < max(1, threshold - 1):
+            in_event = False
+            baseline = value
+        elif not in_event and value >= baseline - 1:
+            baseline = value
+    return count
+
+
+def statistics(rec: Recording) -> dict:
+    oxy = [x for x in rec.spo2 if x is not None]
+    hr = [x for x in rec.pulse if x is not None]
+    if not oxy or not hr:
+        raise ValueError("Keine gültigen Oximetriedaten")
+    below90 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 90)
+    below88 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 88)
+    below85 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 85)
+    valid_seconds = len(oxy) * rec.interval
+    hours = rec.duration / 3600
+    d3 = rec.reported_drops3 if rec.reported_drops3 is not None else desaturations(rec.spo2, 3)
+    d4 = rec.reported_drops4 if rec.reported_drops4 is not None else desaturations(rec.spo2, 4)
+    return {"spo2_min": min(oxy), "spo2_avg": rec.reported_spo2_avg if rec.reported_spo2_avg is not None else sum(oxy) / len(oxy), "spo2_max": max(oxy),
+            "hr_min": min(hr), "hr_avg": rec.reported_hr_avg if rec.reported_hr_avg is not None else sum(hr) / len(hr), "hr_max": max(hr),
+            "spo2_median": statlib.median(oxy), "valid_percent": 100 * valid_seconds / rec.duration if rec.duration else 0,
+            "below90": below90, "below90_percent": 100 * below90 / valid_seconds if valid_seconds else 0,
+            "below88": below88, "below88_percent": 100 * below88 / valid_seconds if valid_seconds else 0,
+            "below85": below85, "below85_percent": 100 * below85 / valid_seconds if valid_seconds else 0,
+            "drops3": d3, "drops4": d4,
+            "odi3": d3 / hours if hours else 0, "odi4": d4 / hours if hours else 0}
+
+
+def duration_text(seconds: float) -> str:
+    seconds = round(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
+
+def decimal_text(value: float, digits: int = 1) -> str:
+    return f"{value:.{digits}f}".replace(".", ",")
+
+
+def datetime_text(value: dt.datetime) -> str:
+    weekday = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")[value.weekday()]
+    return f"{weekday}, {value:%d.%m.%Y}  {value:%H:%M:%S}"
+
+
+def odi_orientation(value: float) -> str:
+    if value < 5:
+        return "niedrig (<5)"
+    if value < 15:
+        return "erhöht (5–<15)"
+    if value < 30:
+        return "deutlich erhöht (15–<30)"
+    return "stark erhöht (≥30)"
+
+
+def write_csv(rec: Recording, destination: Path):
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("Time", "SpO2(%)", "Pulse Rate(bpm)", "Motion"))
+        for index, row in enumerate(zip(rec.spo2, rec.pulse, rec.motion)):
+            stamp = rec.start + dt.timedelta(seconds=index * rec.interval)
+            writer.writerow((stamp.isoformat(), *("" if x is None else x for x in row)))
+
+
+def write_pdf(rec: Recording, destination: Path, patient: str = "", note: str = ""):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    stats = statistics(rec)
+    times = [rec.start + dt.timedelta(seconds=i * rec.interval) for i in range(len(rec.spo2))]
+    oxygen = [float("nan") if x is None else x for x in rec.spo2]
+    pulse = [float("nan") if x is None else x for x in rec.pulse]
+    end = rec.start + dt.timedelta(seconds=rec.duration)
+
+    def graph(fig, area, left, right, detail=False):
+        if left >= right:
+            empty = fig.add_subplot(area)
+            empty.axis("off")
+            return (empty,)
+        axes = area.subgridspec(3, 1, height_ratios=(3, 2, 1), hspace=.10).subplots(sharex=True)
+        axes[0].plot(times, oxygen, color="#1574b8", linewidth=.65)
+        axes[0].fill_between(times, oxygen, 90,
+                             where=[value == value and value <= 90 for value in oxygen],
+                             color="#dc513f", alpha=.18, interpolate=True)
+        axes[0].axhline(90, color="#dc513f", linewidth=.6, linestyle="--")
+        axes[0].set_ylabel("SpO₂ (%)"); axes[0].set_ylim(70, 101)
+        axes[1].plot(times, pulse, color="#dc513f", linewidth=.55)
+        axes[1].set_ylabel("Puls\n(/min)"); axes[1].set_ylim(30, max(150, stats["hr_max"] + 5))
+        axes[2].vlines(times, 0, rec.motion, color="#222", linewidth=.8)
+        axes[2].set_ylabel("Bewegung"); axes[2].set_yticks([])
+        axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        if detail:
+            axes[2].xaxis.set_major_locator(mdates.MinuteLocator(byminute=(0, 15, 30, 45)))
+        else:
+            # The plotting area is indented to make room for the y-axis label.
+            # Move the section heading back to the report's common left edge.
+            axes[0].set_title("Gesamtverlauf", x=-.12, ha="left", fontsize=10.5,
+                              weight="bold", color="#24485d", pad=10)
+        for ax in axes:
+            ax.set_xlim(left, right)
+            ax.set_facecolor("#fbfcfd")
+            ax.grid(True, color="#dfe5e8", linewidth=.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color("#77838a")
+            ax.spines["bottom"].set_color("#77838a")
+            ax.spines["left"].set_linewidth(.6)
+            ax.spines["bottom"].set_linewidth(.6)
+            ax.tick_params(colors="#34444d", labelsize=8, width=.6)
+        return axes
+
+    detail_span = 2 * 3600
+    detail_pages = (rec.duration + detail_span - 1) // detail_span
+    total_pages = 1 + detail_pages
+
+    def page_number(fig, current):
+        fig.text(.93, .025, f"{current}/{total_pages}", ha="right", va="bottom", fontsize=8, color="#555")
+
+    def distribution_plot(ax, values, color, title, xlabel, bins, thresholds=()):
+        valid = sorted(values)
+        weights = [100 / len(valid)] * len(valid)
+        ax.hist(valid, bins=bins, weights=weights, color=color, alpha=.28,
+                edgecolor=color, linewidth=.35)
+        ax.set_title(title, fontsize=9.5, weight="bold", loc="left")
+        ax.set_xlabel(xlabel, fontsize=8)
+        ax.set_ylabel("Zeit je Bereich (%)", fontsize=7.5)
+        ax.tick_params(labelsize=7)
+        ax.set_facecolor("#fbfcfd")
+        ax.grid(True, axis="y", color="#ddd", linewidth=.4)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#77838a")
+        ax.spines["bottom"].set_color("#77838a")
+
+        cumulative = ax.twinx()
+        left, right = ax.get_xlim()
+        steps = 120
+        levels = [left + (right - left) * index / steps for index in range(steps + 1)]
+        shares = [100 * bisect.bisect_right(valid, level) / len(valid) for level in levels]
+        cumulative.plot(levels, shares, color=color, linewidth=1.25)
+        cumulative.set_ylim(0, 100)
+        cumulative.set_ylabel("Zeit ≤ Schwelle (%)", fontsize=7.5)
+        cumulative.tick_params(labelsize=7)
+        cumulative.spines["top"].set_visible(False)
+        cumulative.spines["left"].set_visible(False)
+        cumulative.spines["right"].set_color("#77838a")
+        for level, label in thresholds:
+            share = 100 * bisect.bisect_right(valid, level) / len(valid)
+            ax.axvline(level, color="#666", linewidth=.55, linestyle="--")
+            cumulative.plot(level, share, marker="o", markersize=2.8, color=color)
+            annotation = (f"{label}: {decimal_text(share)}{NBSP}%" if label.startswith("T")
+                          else f"{label}: {level:.0f} {xlabel.split()[-1]}")
+            cumulative.annotate(annotation, (level, share),
+                                xytext=(3, 4), textcoords="offset points", fontsize=6.5,
+                                color="#333")
+
+    with PdfPages(destination) as pdf:
+        fig = plt.figure(figsize=(8.27, 11.69), layout="constrained")
+        fig.get_layout_engine().set(rect=(.12, .06, .81, .89), w_pad=.05, h_pad=.05)
+        grid = fig.add_gridspec(4, 1, height_ratios=(.85, .78, 3.05, 1.35),
+                               hspace=.10)
+        title = fig.add_subplot(grid[0]); title.axis("off")
+        title.text(0, 1, "Checkme O2: Messbericht", transform=title.transAxes,
+                   fontsize=18, weight="bold", va="top", color="#155b86")
+        title.plot((0, 1), (.86, .86), transform=title.transAxes, color="#b9d1df", linewidth=1)
+        header_top = .72
+        if patient:
+            title.text(0, .72, "Patient:", transform=title.transAxes,
+                       fontsize=9.5, va="top", weight="bold", color="#4a5961")
+            title.text(.20, .72, patient, transform=title.transAxes, fontsize=10, va="top")
+            header_top = .56
+        left_rows = (("Messbeginn:", datetime_text(rec.start)),
+                     ("Messende:", datetime_text(end)),
+                     ("Dauer:", duration_text(rec.duration)))
+        right_rows = (f"SpO₂ max. / mittel / min.: {stats['spo2_max']} / {decimal_text(stats['spo2_avg'])} / {stats['spo2_min']}{NBSP}%",
+                      f"Puls max. / mittel / min.: {stats['hr_max']} / {decimal_text(stats['hr_avg'])} / {stats['hr_min']} /min",
+                      f"Gültige Messzeit: {decimal_text(stats['valid_percent'])}{NBSP}%",
+                      f"ODI3 / ODI4: {decimal_text(stats['odi3'])} / {decimal_text(stats['odi4'])} pro Messstunde")
+        for row, (label, value) in enumerate(left_rows):
+            y = header_top - row * .14
+            title.text(0, y, label, transform=title.transAxes,
+                       fontsize=9.5, va="top", weight="bold", color="#4a5961")
+            title.text(.20, y, value, transform=title.transAxes, fontsize=9.7, va="top")
+        for row, text in enumerate(right_rows):
+            y = header_top - row * .14
+            title.text(.54, y, text, transform=title.transAxes,
+                       fontsize=9.0, va="top", color="#25343c")
+        if note:
+            title.text(0, .08, "Notiz: " + note, transform=title.transAxes,
+                       fontsize=9, va="bottom", wrap=True)
+        summary = fig.add_subplot(grid[1]); summary.axis("off")
+        event_source = "Gerätezähler" if rec.reported_drops3 is not None else "von Oxipull berechnet"
+        orientation = odi_orientation(stats["odi3"]).split(" (")[0]
+        summary.text(0, .94, f"ODI3: {decimal_text(stats['odi3'])} pro Messstunde ({orientation})",
+                     transform=summary.transAxes, fontsize=11, weight="bold", color="#155b86")
+        scale_left, scale_width = 0, 1
+        scale_bottom, scale_height = .68, .13
+        scale_max = 40
+        bands = ((0, 5, "niedrig", "#dceaf3"),
+                 (5, 15, "erhöht", "#b9d6e8"),
+                 (15, 30, "deutlich erhöht", "#82b5d3"),
+                 (30, 40, "stark erhöht", "#4f8eb5"))
+        for lower, upper, label, color in bands:
+            x = scale_left + scale_width * lower / scale_max
+            width = scale_width * (upper - lower) / scale_max
+            summary.add_patch(plt.Rectangle((x, scale_bottom), width, scale_height,
+                                             transform=summary.transAxes, facecolor=color,
+                                             edgecolor="white", linewidth=1))
+            summary.text(x + width / 2, scale_bottom + scale_height / 2, label,
+                         transform=summary.transAxes, ha="center", va="center",
+                         fontsize=7.2, color="#18384b")
+        for value in (0, 5, 15, 30):
+            x = scale_left + scale_width * value / scale_max
+            summary.text(x, scale_bottom - .035, str(value), transform=summary.transAxes,
+                         ha="center", va="top", fontsize=7, color="#444")
+        summary.text(scale_left + scale_width, scale_bottom - .035, "40+",
+                     transform=summary.transAxes, ha="center", va="top", fontsize=7, color="#444")
+        marker_x = scale_left + scale_width * min(stats["odi3"], scale_max) / scale_max
+        summary.plot((marker_x, marker_x), (scale_bottom - .015, scale_bottom + scale_height + .015),
+                     transform=summary.transAxes, color="#111", linewidth=1.5,
+                     solid_capstyle="round", clip_on=False)
+        summary.text(marker_x, scale_bottom + scale_height + .025, decimal_text(stats["odi3"]),
+                     transform=summary.transAxes, ha="center", va="bottom",
+                     fontsize=7.5, weight="bold", color="#111",
+                     bbox={"facecolor": "white", "edgecolor": "none", "pad": 1})
+        summary.text(0, .42, f"Entsättigungsphasen ({event_source}): ≥3{NBSP}% Abfall: {stats['drops3']}     ≥4{NBSP}% Abfall: {stats['drops4']}",
+                     transform=summary.transAxes, fontsize=9.3, weight="bold")
+        threshold_stats = ((90, stats["below90"], stats["below90_percent"]),
+                           (88, stats["below88"], stats["below88_percent"]),
+                           (85, stats["below85"], stats["below85_percent"]))
+        for column, (threshold, seconds, percent) in enumerate(threshold_stats):
+            x = column / 3
+            summary.text(x, .19, f"T{threshold}: SpO₂ ≤ {threshold}{NBSP}%",
+                         transform=summary.transAxes, ha="left", va="center",
+                         fontsize=8.4, weight="bold", color="#4a5961")
+            summary.text(x, .04, f"{duration_text(seconds)} ({decimal_text(percent)}{NBSP}%)",
+                         transform=summary.transAxes, ha="left", va="center",
+                         fontsize=8.8)
+        for x in (1 / 3, 2 / 3):
+            summary.plot((x, x), (0, .27), transform=summary.transAxes,
+                         color="#d9e1e5", linewidth=.6)
+        graph(fig, grid[2], rec.start, end)
+        distributions = grid[3].subgridspec(1, 2, wspace=.45)
+        oxygen_values = [value for value in rec.spo2 if value is not None]
+        pulse_values = [value for value in rec.pulse if value is not None]
+        oxygen_left = max(50, min(70, min(oxygen_values)))
+        distribution_plot(fig.add_subplot(distributions[0]), oxygen_values, "#1574b8",
+                          "SpO₂-Verteilung", "SpO₂-Schwelle (%)",
+                          list(range(oxygen_left, 102)), ((85, "T85"), (88, "T88"), (90, "T90")))
+        pulse_left = 5 * (min(pulse_values) // 5)
+        pulse_right = 5 * ((max(pulse_values) + 4) // 5) + 5
+        distribution_plot(fig.add_subplot(distributions[1]), pulse_values, "#dc513f",
+                          "Pulsverteilung", "Pulsschwelle (/min)",
+                          list(range(pulse_left, pulse_right + 1, 5)),
+                          ((stats["hr_avg"], "Mittel"),))
+        page_number(fig, 1)
+        pdf.savefig(fig); plt.close(fig)
+
+        cursor = rec.start
+        page = 2
+        while cursor < end:
+            fig = plt.figure(figsize=(8.27, 11.69), layout="constrained")
+            # Reserve a real header area; suptitle otherwise sits above the
+            # constrained-layout rectangle and appears to have no top margin.
+            fig.get_layout_engine().set(rect=(.12, .07, .81, .80), w_pad=.05, h_pad=.08)
+            right = min(cursor + dt.timedelta(seconds=detail_span), end)
+            outer = fig.add_gridspec(1, 1)
+            graph(fig, outer[0], cursor, right, detail=True)
+            fig.text(.12, .93, f"Detailkurven: {cursor:%d.%m.%Y, %H:%M} bis {right:%H:%M}",
+                     fontsize=13, weight="bold", color="#155b86", ha="left", va="top")
+            page_number(fig, page)
+            pdf.savefig(fig); plt.close(fig)
+            cursor = right
+            page += 1
+
+
+def files_from_info(info: dict) -> list[str]:
+    value = info.get("FileList", "")
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def measurement_name(source_name: str) -> str:
+    """Return the measurement identifier without a format/type suffix."""
+    stem = Path(source_name).stem
+    for suffix in ("-oximetrie-rohdaten", "-oximetrie-messdaten", "-oximetrie-auswertung"):
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
+    return stem
+
+
+def local_recording_name(source_name: str) -> str:
+    return measurement_name(source_name) + "-oximetrie-rohdaten.vld"
+
+
+def local_csv_name(source_name: str) -> str:
+    return measurement_name(source_name) + "-oximetrie-messdaten.csv"
+
+
+def local_report_name(source_name: str) -> str:
+    return measurement_name(source_name) + "-oximetrie-auswertung.pdf"
+
+
+def integer_range(minimum: int, maximum: int):
+    def convert(value: str) -> int:
+        number = int(value)
+        if not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"erwartet: {minimum} bis {maximum}")
+        return number
+    return convert
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Checkme O2 unter Linux auslesen und PDF-Berichte erzeugen",
+        epilog="""DATEN
+  %(prog)s pull [-o ORDNER] [--csv] [--patient NAME] [--note TEXT]
+      Fehlende VLD-Rohdaten laden und fehlende PDFs erzeugen.
+      Mit --csv zusätzlich fehlende CSV-Dateien erzeugen.
+      Standardziel ist das aktuelle Verzeichnis.
+
+  %(prog)s download [GERAETEDATEI] [-o ORDNER]
+      Eine bestimmte oder alle VLD-Rohdateien laden. Standardziel: ./data.
+
+  %(prog)s report DATEI [DATEI ...] [-o ORDNER] [--csv]
+      PDF-Berichte aus vorhandenen VLD/DAT-Dateien neu erzeugen.
+
+GERAET
+  %(prog)s device-info
+      Geräte-, Firmware- und Dateiinformationen anzeigen.
+
+  %(prog)s device-time
+      System- und Gerätezeit nur anzeigen.
+  %(prog)s device-time --sync
+      Aktuelle lokale Linux-Zeit auf das Gerät übertragen und zurücklesen.
+
+  %(prog)s device-settings [OPTIONEN]
+      Ohne Optionen alle Einstellungen anzeigen. Änderbare Optionen:
+      --time YYYY-MM-DD,HH:MM:SS
+      --spo2-alert OFF|70..95
+      --hr-alert on|off  --hr-low 30..100  --hr-high 80..200
+      --vibration 0..100  --sound 0..100
+      --screen on|off  --brightness low|medium|high
+      --factory-reset --yes   ACHTUNG: löscht alle Gerätedaten
+
+COMPLETION
+  %(prog)s completion bash|zsh|fish
+      Shell-Completion auf der Standardausgabe ausgeben.
+
+ALLGEMEIN
+  -h, --help
+      Diese vollständige Hilfe anzeigen.
+
+Typischer Aufruf: %(prog)s pull""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        **({"color": False} if sys.version_info >= (3, 14) else {}),
+        add_help=False,
+    )
+    parser._positionals.title = "Befehle"
+    parser._optionals.title = "Globale Optionen"
+    parser.add_argument("-h", "--help", action="help", help="diese vollständige Hilfe anzeigen")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}",
+                        help="Programmversion anzeigen")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="BEFEHL")
+    completion = sub.add_parser("completion", help="Shell-Completion für Bash, Zsh oder Fish ausgeben")
+    completion.add_argument("shell", choices=tuple(COMPLETIONS))
+    sub.add_parser("device-info", help="Geräteinformationen und Messungsdateien anzeigen")
+    device_time = sub.add_parser("device-time", help="System- und Gerätezeit anzeigen oder synchronisieren")
+    device_time.add_argument("--sync", action="store_true", help="aktuelle lokale Systemzeit auf das Gerät schreiben")
+    pull = sub.add_parser("pull", help="neue Messungen laden und fehlende Berichte erzeugen")
+    pull.add_argument("-o", "--output", type=Path, default=Path("."), metavar="ORDNER",
+                      help="Zielordner (Standard: aktuelles Verzeichnis)")
+    pull.add_argument("--csv", action="store_true", help="zusätzlich fehlende CSV-Dateien erzeugen")
+    pull.add_argument("--patient", default="", metavar="NAME", help="Patientenname in neuen PDFs")
+    pull.add_argument("--note", default="", metavar="TEXT", help="optionale Notiz in neuen PDFs")
+    download = sub.add_parser("download", help="eine oder alle Messungsdateien herunterladen")
+    download.add_argument("filename", nargs="?", help="Name auf dem Gerät; ohne Angabe werden alle Messungen geladen")
+    download.add_argument("-o", "--output", type=Path, default=Path("data"), metavar="ORDNER",
+                          help="Zielordner für lokale Oximetrie-Rohdaten (Standard: data)")
+    report = sub.add_parser("report", help="vorhandene VLD/DAT-Rohdaten neu auswerten")
+    report.add_argument("input", type=Path, nargs="+")
+    report.add_argument("-o", "--output", type=Path, metavar="ORDNER",
+                        help="Zielordner (Standard: Ordner der jeweiligen Rohdatei)")
+    report.add_argument("--csv", action="store_true", help="zusätzlich CSV-Dateien erzeugen")
+    report.add_argument("--patient", default="", metavar="NAME", help="Patientenname im PDF-Kopf")
+    report.add_argument("--note", default="", metavar="TEXT", help="Freitextnotiz im PDF-Kopf")
+    settings = sub.add_parser("device-settings", help="dokumentierte Geräteeinstellungen anzeigen/ändern")
+    settings.add_argument("--time", metavar="YYYY-MM-DD,HH:MM:SS", help="Gerätezeit explizit setzen")
+    settings.add_argument("--spo2-alert", metavar="OFF|PROZENT",
+                          help="SpO₂-Erinnerung ausschalten oder Schwelle von 70 bis 95 setzen")
+    settings.add_argument("--hr-alert", choices=("on", "off"), help="Pulserinnerung ein- oder ausschalten")
+    settings.add_argument("--hr-low", type=integer_range(30, 100), metavar="BPM", help="untere Pulsschwelle (30–100)")
+    settings.add_argument("--hr-high", type=integer_range(80, 200), metavar="BPM", help="obere Pulsschwelle (80–200)")
+    settings.add_argument("--vibration", type=integer_range(0, 100), metavar="PROZENT", help="Vibrationsstärke (0–100)")
+    settings.add_argument("--sound", type=integer_range(0, 100), metavar="PROZENT", help="akustische Erinnerungsstärke (0–100)")
+    settings.add_argument("--screen", choices=("on", "off"), help="Bildschirm dauerhaft an oder normal ausschalten")
+    settings.add_argument("--brightness", choices=("low", "medium", "high"), help="Displayhelligkeit")
+    settings.add_argument("--factory-reset", action="store_true", help="Werkseinstellungen herstellen; löscht alle Gerätedaten")
+    settings.add_argument("--yes", action="store_true", help="zwingend erforderliche Bestätigung für --factory-reset")
+    args = parser.parse_args(argv)
+
+    if args.command == "completion":
+        print(COMPLETIONS[args.shell], end="")
+        return 0
+
+    if args.command == "report":
+        if args.output:
+            args.output.mkdir(parents=True, exist_ok=True)
+        for index, source in enumerate(args.input, start=1):
+            destination = args.output or source.parent
+            pdf_target = destination / local_report_name(source.name)
+            csv_target = destination / local_csv_name(source.name)
+            print(f"Messung {index} von {len(args.input)}: {measurement_name(source.name)}")
+            rec = parse_recording(source)
+            print(f"  PDF wird erstellt: {pdf_target}", flush=True)
+            write_pdf(rec, pdf_target, args.patient, args.note)
+            if args.csv:
+                print(f"  CSV wird erstellt: {csv_target}", flush=True)
+                write_csv(rec, csv_target)
+        pdf_word = "PDF" if len(args.input) == 1 else "PDFs"
+        if args.csv:
+            csv_word = "CSV-Datei" if len(args.input) == 1 else "CSV-Dateien"
+            print(f"Fertig. {len(args.input)} {pdf_word} und "
+                  f"{len(args.input)} {csv_word} erstellt.")
+        else:
+            print(f"Fertig. {len(args.input)} {pdf_word} erstellt.")
+        return 0
+
+    with CheckmeHID() as device:
+        info = device.info()
+        if args.command == "device-info":
+            visible = {key: info.get(key) for key in (
+                "Model", "SN", "HardwareVer", "SoftwareVer", "BootloaderVer",
+                "FileVer", "CurBAT", "CurBatState", "CurTIME"
+            )}
+            visible["Files"] = files_from_info(info)
+            print(json.dumps(visible, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "device-time":
+            system_time = dt.datetime.now().strftime("%Y-%m-%d,%H:%M:%S")
+            print(f"Systemzeit: {system_time}")
+            print(f"Gerätezeit: {info.get('CurTIME', 'nicht zurückgemeldet')}")
+            if args.sync:
+                updated = device.configure({"SetTIME": system_time})
+                print(f"Neue Gerätezeit: {updated.get('CurTIME', 'nicht zurückgemeldet')}")
+            return 0
+        if args.command == "device-settings":
+            changes = {}
+            if args.time:
+                try:
+                    parsed_time = dt.datetime.strptime(args.time, "%Y-%m-%d,%H:%M:%S")
+                except ValueError as exc:
+                    raise ValueError("Zeitformat muss YYYY-MM-DD,HH:MM:SS sein") from exc
+                changes["SetTIME"] = parsed_time.strftime("%Y-%m-%d,%H:%M:%S")
+            if args.spo2_alert is not None:
+                if args.spo2_alert.lower() == "off":
+                    changes["SetOxiSwitch"] = 0
+                else:
+                    try:
+                        threshold = int(args.spo2_alert)
+                    except ValueError as exc:
+                        raise ValueError("--spo2-alert erwartet 'off' oder eine Zahl von 70 bis 95") from exc
+                    if not 70 <= threshold <= 95:
+                        raise ValueError("SpO₂-Schwelle muss zwischen 70 und 95 liegen")
+                    changes.update(SetOxiSwitch=1, SetOxiThr=threshold)
+            if args.hr_alert is not None:
+                changes["SetHRSwitch"] = 1 if args.hr_alert == "on" else 0
+            if args.hr_low is not None:
+                changes.update(SetHRSwitch=1, SetHRLowThr=args.hr_low)
+            if args.hr_high is not None:
+                changes.update(SetHRSwitch=1, SetHRHighThr=args.hr_high)
+            if args.hr_low is not None and args.hr_high is not None and args.hr_low >= args.hr_high:
+                raise ValueError("Die untere Pulsschwelle muss kleiner als die obere sein")
+            if args.vibration is not None:
+                changes["SetMotor"] = args.vibration
+            if args.sound is not None:
+                changes["SetBuzzer"] = args.sound
+            if args.screen is not None:
+                changes["SetLightingMode"] = 2 if args.screen == "on" else 0
+            if args.brightness is not None:
+                changes["SetLightStr"] = {"low": 0, "medium": 1, "high": 2}[args.brightness]
+            if args.factory_reset:
+                if not args.yes:
+                    raise ValueError("--factory-reset löscht alle Gerätedaten und erfordert zusätzlich --yes")
+                device.transact(0x18)
+                print("Werkseinstellungen wurden angefordert; alle Gerätedaten werden gelöscht.")
+                return 0
+            updated = device.configure(changes) if changes else info
+            visible = {key: updated.get(key) for key in (
+                "CurOxiThr", "OxiSwitch", "HRLowThr", "HRHighThr", "HRSwitch",
+                "CurMotor", "CurBuzzer", "CurMode", "LightingMode", "LightStr"
+            ) if key in updated}
+            print(json.dumps(visible, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "pull":
+            args.output.mkdir(parents=True, exist_ok=True)
+            missing = sorted(
+                name for name in files_from_info(info)
+                if (not (args.output / local_recording_name(name)).exists()
+                    or not (args.output / local_report_name(name)).exists()
+                    or (args.csv and not (args.output / local_csv_name(name)).exists()))
+            )
+            if not missing:
+                requested = "Rohdaten, PDFs und CSV-Dateien" if args.csv else "Rohdaten und PDFs"
+                print(f"Alle {requested} sind bereits vorhanden.")
+                return 0
+            loaded = 0
+            pdfs_created = 0
+            csvs_created = 0
+            for index, name in enumerate(missing, start=1):
+                raw = args.output / local_recording_name(name)
+                pdf_target = args.output / local_report_name(name)
+                csv_target = args.output / local_csv_name(name)
+                print(f"Messung {index} von {len(missing)}: {measurement_name(name)}")
+                if not raw.exists():
+                    print(f"  Rohdaten werden geladen: {raw}", flush=True)
+                    raw.write_bytes(device.download(name))
+                    loaded += 1
+                else:
+                    print(f"  Rohdaten bereits vorhanden: {raw}")
+                rec = None
+                if not pdf_target.exists():
+                    print(f"  PDF wird erstellt: {pdf_target}", flush=True)
+                    rec = parse_recording(raw)
+                    write_pdf(rec, pdf_target, args.patient, args.note)
+                    pdfs_created += 1
+                else:
+                    print(f"  PDF bereits vorhanden: {pdf_target}")
+                if args.csv:
+                    if not csv_target.exists():
+                        print(f"  CSV wird erstellt: {csv_target}", flush=True)
+                        write_csv(rec or parse_recording(raw), csv_target)
+                        csvs_created += 1
+                    else:
+                        print(f"  CSV bereits vorhanden: {csv_target}")
+            raw_word = "Rohdatei" if loaded == 1 else "Rohdateien"
+            pdf_word = "PDF" if pdfs_created == 1 else "PDFs"
+            result = f"Fertig. {loaded} {raw_word} geladen, {pdfs_created} {pdf_word} erstellt"
+            if args.csv:
+                csv_word = "CSV-Datei" if csvs_created == 1 else "CSV-Dateien"
+                result += f", {csvs_created} {csv_word} erstellt"
+            print(result + ".")
+            return 0
+        names = ([args.filename] if args.command == "download" and args.filename
+                 else sorted(files_from_info(info)))
+        output = args.output
+        output.mkdir(parents=True, exist_ok=True)
+        loaded = 0
+        for index, name in enumerate(names, start=1):
+            target = output / local_recording_name(name)
+            print(f"Messung {index} von {len(names)}: {measurement_name(name)}")
+            if not target.exists():
+                print(f"  Rohdaten werden geladen: {target}", flush=True)
+                target.write_bytes(device.download(name))
+                loaded += 1
+            else:
+                print(f"  Rohdaten bereits vorhanden: {target}")
+        raw_word = "Rohdatei" if loaded == 1 else "Rohdateien"
+        print(f"Fertig. {loaded} {raw_word} geladen.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, ValueError, TimeoutError, OSError) as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
+        raise SystemExit(1)

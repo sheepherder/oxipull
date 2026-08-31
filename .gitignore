@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Persönliche Messdaten und daraus erzeugte Dateien
+/data/
+*-oximetrie-rohdaten.vld
+*-oximetrie-messdaten.csv
+*-oximetrie-auswertung.pdf
