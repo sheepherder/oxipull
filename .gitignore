@@ -3,6 +3,8 @@ __pycache__/
 
 # Persönliche Messdaten und daraus erzeugte Dateien
 /data/
+/vergleich/
 *-oximetrie-rohdaten.vld
 *-oximetrie-messdaten.csv
 *-oximetrie-auswertung.pdf
+*Checkme O2 Max_*.pdf

@@ -312,9 +312,9 @@ def statistics(rec: Recording) -> dict:
     hr = [x for x in rec.pulse if x is not None]
     if not oxy or not hr:
         raise ValueError("Keine gültigen Oximetriedaten")
-    below90 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 90)
-    below88 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 88)
-    below85 = sum(rec.interval for x in rec.spo2 if x is not None and x <= 85)
+    below90 = sum(rec.interval for x in rec.spo2 if x is not None and x < 90)
+    below88 = sum(rec.interval for x in rec.spo2 if x is not None and x < 88)
+    below85 = sum(rec.interval for x in rec.spo2 if x is not None and x < 85)
     valid_seconds = len(oxy) * rec.interval
     hours = rec.duration / 3600
     d3 = rec.reported_drops3 if rec.reported_drops3 is not None else desaturations(rec.spo2, 3)
@@ -385,7 +385,7 @@ def write_pdf(rec: Recording, destination: Path, patient: str = "", note: str = 
         axes = area.subgridspec(3, 1, height_ratios=(3, 2, 1), hspace=.10).subplots(sharex=True)
         axes[0].plot(times, oxygen, color="#1574b8", linewidth=.65)
         axes[0].fill_between(times, oxygen, 90,
-                             where=[value == value and value <= 90 for value in oxygen],
+                             where=[value == value and value < 90 for value in oxygen],
                              color="#dc513f", alpha=.18, interpolate=True)
         axes[0].axhline(90, color="#dc513f", linewidth=.6, linestyle="--")
         axes[0].set_ylabel("SpO₂ (%)"); axes[0].set_ylim(70, 101)
@@ -441,16 +441,16 @@ def write_pdf(rec: Recording, destination: Path, patient: str = "", note: str = 
         left, right = ax.get_xlim()
         steps = 120
         levels = [left + (right - left) * index / steps for index in range(steps + 1)]
-        shares = [100 * bisect.bisect_right(valid, level) / len(valid) for level in levels]
+        shares = [100 * bisect.bisect_left(valid, level) / len(valid) for level in levels]
         cumulative.plot(levels, shares, color=color, linewidth=1.25)
         cumulative.set_ylim(0, 100)
-        cumulative.set_ylabel("Zeit ≤ Schwelle (%)", fontsize=7.5)
+        cumulative.set_ylabel("Zeit < Schwelle (%)", fontsize=7.5)
         cumulative.tick_params(labelsize=7)
         cumulative.spines["top"].set_visible(False)
         cumulative.spines["left"].set_visible(False)
         cumulative.spines["right"].set_color("#77838a")
         for level, label in thresholds:
-            share = 100 * bisect.bisect_right(valid, level) / len(valid)
+            share = 100 * bisect.bisect_left(valid, level) / len(valid)
             ax.axvline(level, color="#666", linewidth=.55, linestyle="--")
             cumulative.plot(level, share, marker="o", markersize=2.8, color=color)
             annotation = (f"{label}: {decimal_text(share)}{NBSP}%" if label.startswith("T")
@@ -535,7 +535,7 @@ def write_pdf(rec: Recording, destination: Path, patient: str = "", note: str = 
                            (85, stats["below85"], stats["below85_percent"]))
         for column, (threshold, seconds, percent) in enumerate(threshold_stats):
             x = column / 3
-            summary.text(x, .19, f"T{threshold}: SpO₂ ≤ {threshold}{NBSP}%",
+            summary.text(x, .19, f"T{threshold}: SpO₂ < {threshold}{NBSP}%",
                          transform=summary.transAxes, ha="left", va="center",
                          fontsize=8.4, weight="bold", color="#4a5961")
             summary.text(x, .04, f"{duration_text(seconds)} ({decimal_text(percent)}{NBSP}%)",
@@ -589,7 +589,10 @@ def measurement_name(source_name: str) -> str:
     stem = Path(source_name).stem
     for suffix in ("-oximetrie-rohdaten", "-oximetrie-messdaten", "-oximetrie-auswertung"):
         if stem.endswith(suffix):
-            return stem[:-len(suffix)]
+            stem = stem[:-len(suffix)]
+            break
+    if len(stem) == 14 and stem.isdigit():
+        return f"{stem[:4]}-{stem[4:6]}-{stem[6:8]}_{stem[8:10]}-{stem[10:12]}-{stem[12:14]}"
     return stem
 
 

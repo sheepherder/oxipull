@@ -83,7 +83,7 @@ Nach einer Änderung des Berichtslayouts können PDFs jederzeit aus den
 unveränderten VLD-Rohdaten neu erstellt werden:
 
 ```sh
-oxipull report data/20251013005737-oximetrie-rohdaten.vld
+oxipull report data/2025-10-13_00-57-37-oximetrie-rohdaten.vld
 oxipull report data/*-oximetrie-rohdaten.vld --csv
 ```
 
@@ -112,9 +112,9 @@ löscht nach der Warnung der Herstelleranwendung die Messdaten des Geräts.
 Automatisch erzeugte Dateinamen enthalten den Messbeginn und den Inhalt:
 
 ```text
-20251013005737-oximetrie-rohdaten.vld
-20251013005737-oximetrie-messdaten.csv
-20251013005737-oximetrie-auswertung.pdf
+2025-10-13_00-57-37-oximetrie-rohdaten.vld
+2025-10-13_00-57-37-oximetrie-messdaten.csv
+2025-10-13_00-57-37-oximetrie-auswertung.pdf
 ```
 
 Messdaten können Gesundheitsdaten enthalten. `data/` und die automatisch
