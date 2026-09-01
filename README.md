@@ -20,8 +20,6 @@ vom Kernel bereitgestellte hidraw-Schnittstelle angesprochen.
 
 ## Installation
 
-Abhängigkeiten prüfen und anschließend installieren:
-
 ```sh
 make check
 sudo make install
@@ -58,11 +56,20 @@ oxipull pull -o data --csv
 CSV-Dateien werden nicht überschrieben. `--patient` und `--note` gelten nur für
 PDFs, die bei diesem Aufruf neu entstehen.
 
-Die vollständige Hilfe steht in einem Bildschirm:
+Hilfe:
 
 ```sh
 oxipull --help
 ```
+
+## Beispielbericht
+
+Übersicht und Detailansicht mit synthetischen Beispieldaten:
+
+<p>
+  <a href="docs/bericht-uebersicht.png"><img src="docs/bericht-uebersicht.png" alt="Übersichtsseite eines Oxipull-Berichts" width="49%"></a>
+  <a href="docs/bericht-detail.png"><img src="docs/bericht-detail.png" alt="Detailseite eines Oxipull-Berichts" width="49%"></a>
+</p>
 
 ## Befehle
 
@@ -76,8 +83,7 @@ oxipull --help
 
 ### Berichte neu erzeugen
 
-Nach einer Änderung des Berichtslayouts können PDFs jederzeit aus den
-unveränderten VLD-Rohdaten neu erstellt werden:
+PDFs aus Rohdaten neu erzeugen:
 
 ```sh
 oxipull report data/2025-10-13_00-57-37-oximetrie-rohdaten.vld
@@ -89,9 +95,8 @@ anderer Zielordner kann mit `-o ORDNER` gewählt werden.
 
 ### Gerät und Einstellungen
 
-`device` zeigt ohne Optionen verständlich bezeichnete Geräteinformationen,
-Einstellungen und vorhandene Aufzeichnungen. Geschrieben wird nur bei
-ausdrücklich angegebenen Optionen:
+`device` zeigt Geräteinformationen, Einstellungen und vorhandene
+Aufzeichnungen. Änderungen erfolgen nur mit ausdrücklich angegebenen Optionen:
 
 ```sh
 oxipull device
@@ -102,7 +107,6 @@ oxipull device --vibration 60 --sound 60
 oxipull device --screen off
 ```
 
-Alle verfügbaren Optionen und Werte zeigt `oxipull --help`. Der Aufruf
 `device --factory-reset --yes` fordert die Werkseinstellungen an und
 löscht nach der Warnung der Herstelleranwendung die Messdaten des Geräts.
 
@@ -146,8 +150,7 @@ Die USB-Kapselung wurde anhand der Herstelleranwendung und des angeschlossenen
 Geräts untersucht. Vollständige Downloads wurden bytegenau mit den von O2
 Insight Pro gespeicherten VLD-Dateien verglichen.
 
-Für Protokoll und Dateiformat waren folgende freie Projekte wichtige
-Vorarbeiten und Referenzen:
+Referenzen für Protokoll und Dateiformat:
 
 - [viatom-develop/LepuDemo](https://github.com/viatom-develop/LepuDemo)
   dokumentiert die Gerätefelder und Betriebsmodi im Hersteller-SDK.
@@ -166,5 +169,4 @@ jeweiligen Inhaber.
 
 ## Lizenz
 
-Oxipull ist unter `GPL-3.0-or-later` veröffentlicht. Der vollständige Text
-steht in [LICENSE](LICENSE).
+[GPL-3.0-or-later](LICENSE)

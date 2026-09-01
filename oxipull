@@ -499,14 +499,15 @@ def write_pdf(rec: Recording, destination: Path, patient: str = "", note: str = 
         cumulative.spines["top"].set_visible(False)
         cumulative.spines["left"].set_visible(False)
         cumulative.spines["right"].set_color("#77838a")
-        for level, label in thresholds:
+        for index, (level, label) in enumerate(thresholds):
             share = 100 * bisect.bisect_left(valid, level) / len(valid)
             ax.axvline(level, color="#666", linewidth=.55, linestyle="--")
             cumulative.plot(level, share, marker="o", markersize=2.8, color=color)
             annotation = (f"{label}: {decimal_text(share)}{NBSP}%" if label.startswith("T")
                           else f"{label}: {level:.0f} {xlabel.split()[-1]}")
+            offset = (3, 4 + 9 * index) if label.startswith("T") else (3, 4)
             cumulative.annotate(annotation, (level, share),
-                                xytext=(3, 4), textcoords="offset points", fontsize=6.5,
+                                xytext=offset, textcoords="offset points", fontsize=6.5,
                                 color="#333")
 
     with PdfPages(destination) as pdf:
