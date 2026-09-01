@@ -71,10 +71,7 @@ oxipull --help
 | `pull` | Fehlende Rohdaten laden und fehlende PDF-Berichte erzeugen |
 | `download` | Ausschließlich VLD-Rohdaten laden |
 | `report` | PDFs aus vorhandenen VLD-Dateien neu erzeugen |
-| `device-info` | Geräteinformationen und vorhandene Messungen anzeigen |
-| `device-time` | Systemzeit und Gerätezeit anzeigen |
-| `device-time --sync` | Aktuelle Systemzeit auf das Gerät übertragen |
-| `device-settings` | Geräteeinstellungen anzeigen oder ändern |
+| `device` | Gerät, Einstellungen und vorhandene Messungen anzeigen oder ändern |
 | `completion` | Completion für Bash, Zsh oder Fish ausgeben |
 
 ### Berichte neu erzeugen
@@ -90,21 +87,23 @@ oxipull report data/*-oximetrie-rohdaten.vld --csv
 `report` überschreibt gleichnamige PDF- und, mit `--csv`, CSV-Dateien. Ein
 anderer Zielordner kann mit `-o ORDNER` gewählt werden.
 
-### Geräteeinstellungen
+### Gerät und Einstellungen
 
-Ohne Änderungsoption zeigt `device-settings` die ausgelesenen Einstellungen an.
-Geschrieben wird nur bei ausdrücklich angegebenen Optionen:
+`device` zeigt ohne Optionen verständlich bezeichnete Geräteinformationen,
+Einstellungen und vorhandene Aufzeichnungen. Geschrieben wird nur bei
+ausdrücklich angegebenen Optionen:
 
 ```sh
-oxipull device-time --sync
-oxipull device-settings --spo2-alert 90
-oxipull device-settings --hr-low 50 --hr-high 120
-oxipull device-settings --vibration 60 --sound 60
-oxipull device-settings --screen off --brightness medium
+oxipull device
+oxipull device --sync-time
+oxipull device --spo2-alert 90
+oxipull device --hr-low 50 --hr-high 120
+oxipull device --vibration 60 --sound 60
+oxipull device --screen off
 ```
 
 Alle verfügbaren Optionen und Werte zeigt `oxipull --help`. Der Aufruf
-`device-settings --factory-reset --yes` fordert die Werkseinstellungen an und
+`device --factory-reset --yes` fordert die Werkseinstellungen an und
 löscht nach der Warnung der Herstelleranwendung die Messdaten des Geräts.
 
 ## Dateien
@@ -150,6 +149,8 @@ Insight Pro gespeicherten VLD-Dateien verglichen.
 Für Protokoll und Dateiformat waren folgende freie Projekte wichtige
 Vorarbeiten und Referenzen:
 
+- [viatom-develop/LepuDemo](https://github.com/viatom-develop/LepuDemo)
+  dokumentiert die Gerätefelder und Betriebsmodi im Hersteller-SDK.
 - [farolone/wellue-o2ring-protocol](https://github.com/farolone/wellue-o2ring-protocol)
   dokumentiert Paketformat, CRC, Dateikommandos und VLD-Version 3.
 - [MackeyStingray/o2r](https://github.com/MackeyStingray/o2r) implementiert
